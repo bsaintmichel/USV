@@ -43,8 +43,8 @@ def print_details(path:str, config:dict):
     rotor = config['right']
     device = config['device']
 
-    print('\n')
-    printm(f'Processing {abspath} : **Using {device}**', color='green' if device == 'cuda' else 'orange')
+    printm('-----')
+    printm(f'**Processing {abspath} : Using {device}**', color='green' if device == 'cuda' else 'orange')
     printm(f'Ref. used : {absrefpath}')
     printm(f'Window size = {n_wavelengths:.2f} λ | Overlap {overlap:.2f} | Rotor position {rotor} px')
 
@@ -75,7 +75,7 @@ def update_config(config:dict, prms:dict, save_path=None, ref_path=None) -> dict
     config['path'] = save_path
 
     if prms['right'] >= config['nx']:
-        print(f'update_config: right={prms["right"]} too far, changing it to {config["nx"]-1}')  
+        printm(f'update_config: right={prms["right"]} too far, changing it to {config["nx"]-1}')  
         prms['right'] = config['nx'] - 1
 
     if save_path is not None:
@@ -257,7 +257,7 @@ def make_ref(ref_path:str,
     dat_files = sorted(dat_files, key=filenum)
 
     if ref_file and not recompute:
-        print(f'make_ref: Loading {ref_file[0]}')
+        printm(f'make_ref: Loading {ref_file[0]}')
         ref = np.array(json.load(open(ref_file[0])))
         return ref
     
@@ -288,9 +288,14 @@ def hilbert(data : np.ndarray, window: int, stride: int) -> torch.Tensor:
     data_freq = torch.tile(torch.fft.fftfreq(data.shape[-1]), [data.shape[0],1])
     data_het = (data_hat * ((2 * (data_freq > 0)) + (data_freq == 0)))
     hil_int = torch.abs(torch.fft.ifft(data_het)).to(float)
-    averager = AvgPool1d(kernel_size=window, stride=stride)
-
-    return averager(hil_int)
+    averager = AvgPool1d(kernel_size=stride, stride=stride)
+    hil_avg = averager(hil_int)
+    _, nhil = hil_avg.shape
+    trim = (window - stride) // stride # To match displacement matrix 
+    left_trim, right_trim = trim // 2, nhil - (trim - trim // 2) # Dispatching it between left and right
+    hil_trim = hil_avg[:, left_trim:right_trim]
+    
+    return hil_trim
 
 
 def displacement(data: np.ndarray, window:int, stride:int, max_disp=None) -> tuple[torch.Tensor]:
@@ -312,7 +317,7 @@ def displacement(data: np.ndarray, window:int, stride:int, max_disp=None) -> tup
     """
     
     if max_disp >= window - 1: 
-        print(f'displacement: correlation max_disp {max_disp} exceeds maximum size {window} - 2')
+        printm(f'displacement: correlation max_disp {max_disp} exceeds maximum size {window} - 2')
         max_disp = window - 2
 
     old = torch.tensor(sliding_window_view(data, window, axis=1)[:-1, ::stride,:].copy())
@@ -374,7 +379,7 @@ def process(bf_files:list[str], config:dict, recompute=True, sep='\\'):
     # What to do if data already exists
     match = glob.glob(''.join(bf_files[0].split(sep)[:-1]) + '/processed.npz')
     if match and not recompute:
-        print(f'process: Found {match[0]}, loading it. Set `recompute=True` to reprocess')
+        printm(f'process: Found {match[0]}, loading it. Set `recompute=True` to reprocess')
         data = np.load(match[0])
         return data['hil'], data['disp'], data['score']
 
@@ -398,6 +403,7 @@ def process(bf_files:list[str], config:dict, recompute=True, sep='\\'):
     hil_all = torch.stack(hil_all).cpu().numpy()
     disp_all = torch.stack(disp_all).cpu().numpy()
     score_all = torch.stack(score_all).cpu().numpy()
+
 
     return hil_all, disp_all, score_all
 
@@ -466,6 +472,7 @@ def bf_indices_coeffs(config:dict) -> tuple[torch.tensor]:
     * flat_idx_right : right summation indices in the flattened US map to produce the beamformed signam
     * coeff_left : weight coefficient for the summation (left part)
     * coeff_right : weight coefficient for the summation (right part)
+    * valid : the valid indices --> useful for the bf signal normalisation !
 
     NOTE: this means that somewhere later in the code, you do `bf3d = coeff_left * us_flat[flat_idx_left] + coeff_right + us_flat[flat_idx_right]` 
     """
@@ -489,23 +496,27 @@ def bf_indices_coeffs(config:dict) -> tuple[torch.tensor]:
     
     i0 = np.moveaxis(np.tile(np.arange(nz), [nx,2*nbf+1,1]), [0,1,2], [1,2,0])  # Build 3d table with i0 indices
     i = i0 + np.tile(np.arange(-nbf,nbf+1), [nz,nx,1]) # Build 3d table with i = i0 + (i-i0) indices (they increase over the 3rd dimension)
-
-    # Deal with out of bounds
-    j_invalid = jint + 1 >= config['right']
-    i_invalid = (i < 0) | (i >= 128) # Validate the i's
-    i[i_invalid] = 0
-    jint[j_invalid] = 0
-    coeff_left[i_invalid | j_invalid] = 0
-    coeff_right[i_invalid | j_invalid] = 0
-
+    
     # Compute the "flat" indices
     flat_idx_left = i*640 + jint
     flat_idx_right = i*640 + jint + 1
+
+    # Deal with out of bounds
+    j_valid = jint + 1 < config['right']
+    i_valid = (i >= 0) & (i < 128) # Validate the i's
+    valid = i_valid & j_valid
+    n_valid = valid.sum(axis=-1)
+    n_valid[n_valid == 0] = 1 # To avoid 0/0 issues later on
+    flat_idx_left[~valid] = 0
+    flat_idx_right[~valid] = 0
+    coeff_left[~valid] = 0
+    coeff_right[~valid] = 0
     
     return torch.tensor(flat_idx_left), \
         torch.tensor(flat_idx_right), \
         torch.tensor(coeff_left), \
-        torch.tensor(coeff_right)
+        torch.tensor(coeff_right), \
+        torch.tensor(n_valid)
 
 
 def beamform(file_strs:list[str], config:dict, ref=None, recompute=False, batch_size=100) -> list[str]:
@@ -522,25 +533,17 @@ def beamform(file_strs:list[str], config:dict, ref=None, recompute=False, batch_
     bf_file_strs = [f_str.replace('.dat', '.dbf') for f_str in file_strs]
     match = glob.glob(file_strs[0].replace('.dat', '.dbf'))
     if (not recompute) and match:
-        print('beamform : Found .dbf files, not recomputing')
+        printm('beamform : Found .dbf files, not recomputing')
         return bf_file_strs
 
     # Extracting relevant info from the config dict
     n_pts = config['nx']
     n_batches = np.ceil(config['npulses_total']/batch_size).astype(np.int_)
-    c = config['c'] 
-    t_us = np.array(config['time_us'])
-    left = config['left']
-    right = config['right']
-    if left is None: left = 0
-    if right is None: right = n_pts
-    if right > n_pts : right = n_pts
-    
     
     # Beamforming loop
     orig_files = open_all(file_strs)
     bf_files = open_all(bf_file_strs, mode='w')
-    idx_left, idx_right, weight_left, weight_right = bf_indices_coeffs(config)
+    idx_left, idx_right, weight_left, weight_right, n_valid = bf_indices_coeffs(config)
     
     for _ in tqdm(range(n_batches), desc='beamform'):
 
@@ -549,14 +552,15 @@ def beamform(file_strs:list[str], config:dict, ref=None, recompute=False, batch_
         us_batch_flat = torch.tensor(np.reshape(us_batch, [batch_size, -1])) # 2d us_batch 
 
         for us_flat in us_batch_flat:
-            bf = (weight_left * us_flat[idx_left] + weight_right * us_flat[idx_right]).mean(dim=-1) 
+            bf = (weight_left * us_flat[idx_left] 
+                  + weight_right * us_flat[idx_right]) \
+                  .sum(dim=-1) / n_valid
             bf_batch.append(bf)
 
         # When batch is processed, back to numpy
         bf_3d = torch.cat(bf_batch, dim=-1).cpu().numpy()
         bf_batch = []
         write_map(bf_files, bf_3d)
-    
 
     close_all(bf_files)
     close_all(orig_files)
