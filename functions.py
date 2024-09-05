@@ -1,17 +1,17 @@
+import os
 import torch 
 import json
 import glob
 import numpy as np
+import math
 
 from torch.nn import AvgPool1d
 from numpy.lib.stride_tricks import sliding_window_view
 from torchaudio.transforms import FFTConvolve, Convolve
 from scipy.io import loadmat
-from numba import njit, cuda
 from io import BufferedIOBase
-from tqdm import tqdm
-
-from colorama import Fore, Style
+from tqdm.notebook import tqdm
+from IPython.display import Markdown, display
 
 """
 Quick disclaimer : 
@@ -22,29 +22,42 @@ n_z or n_i0 is the number of channels : it should be 128
 
 """
 
+#####################################
+############## PRETTY PRINTS #######
+
+def printm(text:str, color=None):
+    """ A pretty print using Markdown"""
+    if color is None:
+        colorstr = text
+    else:
+        colorstr = f"<span style='color:{color}'>{text}</span>"
+    display(Markdown(colorstr))
+
+
+def print_details(path:str, config:dict):
+    """ Prints details about the experiment based on its path"""
+    abspath = os.path.abspath(path)
+    absrefpath = os.path.abspath(config['ref_path'])
+    n_wavelengths = config['window'] / config['fsample'] * config['fpulse'] # There is a 1/2 factor in Vincent's/Thomas's code and I have no idea why...
+    overlap = 1 - config['stride'] / config['window']
+    rotor = config['right']
+    device = config['device']
+
+    print('\n')
+    printm(f'Processing {abspath} : **Using {device}**', color='green' if device == 'cuda' else 'orange')
+    printm(f'Ref. used : {absrefpath}')
+    printm(f'Window size = {n_wavelengths:.2f} λ | Overlap {overlap:.2f} | Rotor position {rotor} px')
+
 ######################################
 ############ FILE MANAGEMENT #########
-######################################
 
 def find_files(path:str, ext='dat'):
     """ Finds Speckle files using glob and sorts them numerically"""
-    files = np.array(glob.glob(path + '\*'+ ext))
+    files = np.array(glob.glob(path + '/*'+ ext))
     filenum = lambda file : int(file.split('.')[0].split('_')[-1])
     files = sorted(files, key=filenum)
     return files
 
-def print_details(path:str, config:dict):
-    """ Prints details about the experiment based on its path"""
-    n_wavelengths = config['window'] / config['fsample'] * config['fpulse'] # There is a 1/2 factor in Vincent's/Thomas's code and I have no idea why...
-    overlap = 1 - config['stride'] / config['window']
-    rotor = config['right']
-    ref_path = config['ref_path']
-    
-    print(Fore.GREEN, end='')
-    print(f'\nProcessing {path} ...')
-    print(Style.RESET_ALL, end='')
-    print(f'Ref. used at : {ref_path}')
-    print(f'Window size = {n_wavelengths:.2f} λ | Overlap {overlap:.2f} | Rotor position {rotor} px')
     
 
 def update_config(config:dict, prms:dict, save_path=None, ref_path=None) -> dict:
@@ -116,6 +129,48 @@ def load_config(config_file_uri:str) -> dict:
 
     return new_confdict
 
+
+def open_all(file_strs:list[str],  mode='r', skip=120) -> list:
+    """ Opens all speckle files. Skips the first
+    (useless) 120 bytes and returns the open files
+    INPUTS
+     * file_strs : list of file STRS
+     * mode [optional] [ 'w' or 'r'] : 
+     * skip [optional] : number of bytes to skip at beginning of file
+     
+    OUTPUT : list of FILE HANDLES
+     """
+
+    file_handles = []
+    for file_str in file_strs:
+        if mode == 'r':
+            file = open(file_str, 'rb')
+            file.read(skip)
+        else: 
+            file = open(file_str, 'wb')
+            file.write(b'\x00'*skip)
+        file_handles.append(file)
+    return file_handles
+
+
+def write_map(file_handles:list[BufferedIOBase], us_map:np.ndarray) -> None:
+    """Writes a single (or multiple) US maps into files
+    NOTE : WE WRITE AS _FLOATS_ instead of int16"""
+    if us_map.ndim > 2: # should be (Nt, Nz, Nx)
+        nt, nz, nx = np.shape(us_map)
+        us_map = np.moveaxis(us_map, 0, 1) # Otherwise reshape fails 
+        us_map = us_map.reshape([nz, nt * nx])
+    
+    for chno, file in enumerate(file_handles):
+        file.write(us_map[chno,:].astype(np.float32).tobytes())
+
+
+def close_all(file_handles:list[BufferedIOBase]) -> None:
+    """ Closes all file handles.
+    INPUT : list of FILE HANDLES """
+    for file in file_handles:
+        file.close()
+
 def read_waveform(file_uri:str, config:dict, mode='raw') -> torch.Tensor:
     """Reads one waveform file and returns it as a 2D np.ndarray
     * You need to specify the config
@@ -146,8 +201,42 @@ def read_waveform(file_uri:str, config:dict, mode='raw') -> torch.Tensor:
     return data
 
 
+def read_map_batch(file_handles:list[BufferedIOBase], n_pts:int, ref=None, batch_size=1, mode='dat') -> np.ndarray:
+    """ Reads a batch of US maps. NB: mode must be .dat or .dbf !
+    
+    NOTE: nskip represent the number of bytes skipped at the beginning of the file. We "simulate" the same
+    number of metadata bytes as in the original files ==> 30 int16 ==> 120 bytes
+    
+    NOTE 2 : There is no check whatsoever that the number of bytes requested will be effectively
+    loaded, in particular at the end of the file...""" 
+
+    dat_list = []
+
+    if mode == 'dat':
+        for file in file_handles: # NOTE  : files need to be numerically sorted
+            dat = file.read(batch_size * n_pts * 2 ) # np.int16 : two bytes per point
+            dat = np.reshape(np.frombuffer(dat, dtype=np.int16), [-1, n_pts])
+            dat = (dat - (dat // 2048) * 4096).astype(float)
+            dat_list.append(dat)
+        
+    if mode == 'dbf':
+        for file in file_handles: # NOTE  : files need to be numerically sorted
+            dat = file.read(batch_size * n_pts * 4 ) # np.int16 : two bytes per point
+            dat = np.reshape(np.frombuffer(dat, dtype=np.float32), [-1, n_pts])
+            dat_list.append(dat)
+
+    us = np.stack(dat_list)
+    us = np.moveaxis(us, 1, 0)      # us is now (Nt, Nz, Nx)
+
+    if ref is not None: 
+        if ref.ndim == 2: 
+            ref = ref[np.newaxis, :, :]
+            us = us - ref
+
+    return us
+
 ######################################
-############ GENERAL PROCESSING #########
+############ GENERAL PROCESSING ######
 ######################################
 
 def make_ref(ref_path:str, 
@@ -193,11 +282,11 @@ def hilbert(data : np.ndarray, window: int, stride: int) -> torch.Tensor:
     NOTE 1 : I expect data to be of shape (N_waveforms x N_pts_per_waveform)
     NOTE 2 : The reference must be subtracted from the data
      before you do anything """
-    
+
     data = torch.tensor(data)
     data_hat = torch.fft.fft(data)
     data_freq = torch.tile(torch.fft.fftfreq(data.shape[-1]), [data.shape[0],1])
-    data_het = data_hat * ((2 * (data_freq > 0)) + (data_freq == 0))
+    data_het = (data_hat * ((2 * (data_freq > 0)) + (data_freq == 0)))
     hil_int = torch.abs(torch.fft.ifft(data_het)).to(float)
     averager = AvgPool1d(kernel_size=window, stride=stride)
 
@@ -306,9 +395,9 @@ def process(bf_files:list[str], config:dict, recompute=True, sep='\\'):
         score_all.append(score)
 
 
-    hil_all = np.stack(hil_all)
-    disp_all = np.stack(disp_all)
-    score_all = np.stack(score_all)
+    hil_all = torch.stack(hil_all).cpu().numpy()
+    disp_all = torch.stack(disp_all).cpu().numpy()
+    score_all = torch.stack(score_all).cpu().numpy()
 
     return hil_all, disp_all, score_all
 
@@ -358,80 +447,69 @@ def calibrate_one(calib:dict, config:dict, disp=None, folder=None):
 
     return r_true, velocity, v_mf, v_profile, v_std
 
-###########################################
-########## Beamforming : general ##########
-###########################################
+
+def bf_indices_coeffs(config:dict) -> tuple[torch.tensor]:
+    """Computes (once and for all) the delays _dj_ associated to beamforming
+    at a position (_,j0) [the delays are the same regardless of i0, the channel number].
+    The shifts are then converted to actual indices _i and j_ used for the beamforming sum for a given set of initial
+    indices _i0, j0_. We finally build a Nz x Nx x Nbf array of indices to sum in the original speckle file to produce the beamformed 
+    signal when we sum over the last dimension. We _actually_ build two of these tables and two tables of 
+    weight factors to accommodate for non-integer delays _dj_
+
+    ARGS
+    ----
+    config : dict with the usual stuff
+
+    RETURNS
+    ----
+    * flat_idx_left  : left summation indices in the flattened US map [ see np.ravel() ]  to produce the beamformed signal
+    * flat_idx_right : right summation indices in the flattened US map to produce the beamformed signam
+    * coeff_left : weight coefficient for the summation (left part)
+    * coeff_right : weight coefficient for the summation (right part)
+
+    NOTE: this means that somewhere later in the code, you do `bf3d = coeff_left * us_flat[flat_idx_left] + coeff_right + us_flat[flat_idx_right]` 
+    """
+
+    c = config['c']
+    dz = config['dz']
+    nx = config['nx']
+    nz = config['nz']
+    nbf = config['nchan_bf']
+    fsample = config['fsample']
+    
+    x = np.atleast_2d(config['time_us']) * config['c'] / 2 
+    di = np.atleast_2d(np.arange(-nbf,nbf+1)).T
+    dj = fsample * x/c * ((1 + (dz * di)**2/x**2) ** 0.5 - 1)  # For each j0 (initial), computes the dj((i-i0, j0))
+    j = np.moveaxis(np.tile(np.arange(nx) + dj, [nz, 1, 1]), 1,-1) # Build a 3d array with j + dj(i-i0, j0) 
+    jint = np.floor(j) # Integer part (used for indices)
+    jfrac = j - jint # Fractional part used by the weights
+    jint = jint.astype(np.int_)
+    coeff_left = (1-jfrac)
+    coeff_right = jfrac
+    
+    i0 = np.moveaxis(np.tile(np.arange(nz), [nx,2*nbf+1,1]), [0,1,2], [1,2,0])  # Build 3d table with i0 indices
+    i = i0 + np.tile(np.arange(-nbf,nbf+1), [nz,nx,1]) # Build 3d table with i = i0 + (i-i0) indices (they increase over the 3rd dimension)
+
+    # Deal with out of bounds
+    j_invalid = jint + 1 >= config['right']
+    i_invalid = (i < 0) | (i >= 128) # Validate the i's
+    i[i_invalid] = 0
+    jint[j_invalid] = 0
+    coeff_left[i_invalid | j_invalid] = 0
+    coeff_right[i_invalid | j_invalid] = 0
+
+    # Compute the "flat" indices
+    flat_idx_left = i*640 + jint
+    flat_idx_right = i*640 + jint + 1
+    
+    return torch.tensor(flat_idx_left), \
+        torch.tensor(flat_idx_right), \
+        torch.tensor(coeff_left), \
+        torch.tensor(coeff_right)
+
 
 def beamform(file_strs:list[str], config:dict, ref=None, recompute=False, batch_size=100) -> list[str]:
-    """ Just a wrapper between the two beamform (`beamform_gpu` and `beamform_cpu`) programmes """
-    if config['do_cuda']: 
-        bf_file_strs = beamform_gpu(file_strs, config, ref, recompute, blocks_per_grid=batch_size)
-    else:
-        bf_file_strs = beamform_cpu(file_strs, config, ref, recompute, batch_size=batch_size)
-    return bf_file_strs
-
-
-def compute_delays(t_us:np.ndarray, c:float, pitch:float, fech:float, nbf:int) -> np.ndarray:
-    """Computes (once and for all) the delays associated to beamforming
-    at a position (j) [so for each position of t_us] considering a sound
-    velocity c, a distance between transducer elements pitch, a sampling frequency 
-    fech and a number of beamforming channels nbf"""
-
-    # XXX : SOMETHING FISHY SINCE x0 = c t0 / 2
-
-    x = np.atleast_2d(t_us) * c / 2 
-    di = np.atleast_2d(np.arange(-nbf,nbf+1)).T
-    dj = fech * x/c * ((1 + (pitch * di)**2/x**2) ** 0.5 - 1)  # For each j0 (initial), computes the dj((i-i0, j0))
-    return dj
-
-
-def open_all(file_strs:list[str],  mode='r', skip=120) -> list:
-    """ Opens all speckle files. Skips the first
-    (useless) 120 bytes and returns the open files
-    INPUTS
-     * file_strs : list of file STRS
-     * mode [optional] [ 'w' or 'r'] : 
-     * skip [optional] : number of bytes to skip at beginning of file
-     
-    OUTPUT : list of FILE HANDLES
-     """
-
-    file_handles = []
-    for file_str in file_strs:
-        if mode == 'r':
-            file = open(file_str, 'rb')
-            file.read(skip)
-        else: 
-            file = open(file_str, 'wb')
-            file.write(b'\x00'*skip)
-        file_handles.append(file)
-    return file_handles
-
-
-def write_map(file_handles:list[BufferedIOBase], us_map:np.ndarray) -> None:
-    """Writes a single (or multiple) US maps into files
-    NOTE : WE WRITE AS _FLOATS_ instead of int16"""
-    if us_map.ndim > 2: # should be (Nt, Nz, Nx)
-        nt, nz, nx = np.shape(us_map)
-        us_map = np.moveaxis(us_map, 0, 1) # Otherwise reshape fails 
-        us_map = us_map.reshape([nz, nt * nx])
-    
-    for chno, file in enumerate(file_handles):
-        file.write(us_map[chno,:].astype(np.float32).tobytes())
-
-
-def close_all(file_handles:list[BufferedIOBase]) -> None:
-    """ Closes all file handles.
-    INPUT : list of FILE HANDLES """
-    for file in file_handles:
-        file.close()
-
-###########################################
-########## Beamforming : CPU ##############
-###########################################
-
-def beamform_cpu(file_strs:list[str], config:dict, ref=None, recompute=False, batch_size=100) -> list[str]:
-    """Beamforms all ultrasound files on the CPU. You can trim the files in x (time_us axis)
+    """Beamforms all ultrasound files. You can trim the files in x (time_us axis)
     with the `left` and `right` indices.
     
     NOTE 1 : Beamformed files are in __float32__ format their name is Speckle_xxx.dbf
@@ -458,23 +536,24 @@ def beamform_cpu(file_strs:list[str], config:dict, ref=None, recompute=False, ba
     if right is None: right = n_pts
     if right > n_pts : right = n_pts
     
+    
     # Beamforming loop
     orig_files = open_all(file_strs)
     bf_files = open_all(bf_file_strs, mode='w')
-    dj = compute_delays(t_us, c, config['dz'], config['fsample'], config['nchan_bf'])
+    idx_left, idx_right, weight_left, weight_right = bf_indices_coeffs(config)
     
-    for _ in tqdm(range(n_batches), 
-                  desc='beamform' + Fore.YELLOW + ' using CPU' + Style.RESET_ALL):
+    for _ in tqdm(range(n_batches), desc='beamform'):
 
         bf_batch = []
         us_batch = read_map_batch(orig_files, n_pts=n_pts, ref=ref, batch_size=batch_size)
+        us_batch_flat = torch.tensor(np.reshape(us_batch, [batch_size, -1])) # 2d us_batch 
 
-        for us in us_batch:
-            bf = bf_cpu_single(us, dj, right=right)
+        for us_flat in us_batch_flat:
+            bf = (weight_left * us_flat[idx_left] + weight_right * us_flat[idx_right]).mean(dim=-1) 
             bf_batch.append(bf)
 
-        # When batch is processed
-        bf_3d = np.stack(bf_batch)
+        # When batch is processed, back to numpy
+        bf_3d = torch.cat(bf_batch, dim=-1).cpu().numpy()
         bf_batch = []
         write_map(bf_files, bf_3d)
     
@@ -483,216 +562,4 @@ def beamform_cpu(file_strs:list[str], config:dict, ref=None, recompute=False, ba
     close_all(orig_files)
     return bf_file_strs
 
-@njit
-def bf_cpu_single(us:np.ndarray, dj:np.ndarray, right:int):        
-    """ Beamforms one ultrasound map
-    ARGS
-    ----
-    * us : a (2d) ultrasound map of the form us = us[i0, j0]
-    * dj : the delay matrix in the form dj = dj[i-i0, j0]
-    
-    RETURNS
-    ----
-    * bf (same size as US) : the beamformed map
-        
-    NOTE 1 : You can produce the delay matrix using `compute_delays`
-    """
 
-
-    ni0, nj0 = us.shape
-    ni, _ = dj.shape            # the indices 0 ... ni [i call them rows_retards] correspond to a shift (i - i0) of - nbf to nbf
-    nbf = (ni - 1) // 2         # so 1 + 2*nbf = ni
-    bf = np.zeros_like(us)
-    us_flat = us.ravel()
-    
-    # Some things can be computed out of the loops. Let's do it
-    di = np.arange(-nbf, nbf+1)[:, np.newaxis]
-    j = np.arange(nj0) + dj
-    j_int = np.floor(j).astype(np.int_)
-    j_frac = j - j_int
-
-    valid_j = (j_int + 1 < right) | ((dj == 0) & (j_int < right)) # Case 1 (non int j) we spill over next point / otherwise we don't
-    valid_i = np.zeros_like(valid_j).astype(np.bool_)
-
-    for i0 in range(ni0):
-
-        i = i0 + np.zeros_like(dj).astype(np.int_) + di
-        valid_i = (i >= 0) & (i < ni0) 
-        valid = valid_i & valid_j
-        idx_flat = (j_int + i * nj0)
-
-        for j0 in range(right): # New implementation cannot deal with beam forming on the rightmost point, so I am skipping it
-
-            is_valid = valid[:,j0]
-            n_valid = is_valid.astype(np.int_).sum()
-            left_idx = idx_flat[:,j0][is_valid]
-            right_idx = left_idx + 1
-            right_coef = j_frac[:,j0][is_valid]
-            left_coef = 1 - right_coef
-            left_part = us_flat[left_idx] * left_coef
-            right_part = us_flat[right_idx] * right_coef
-            bf[i0,j0] = (left_part.sum() + right_part.sum())/n_valid
-
-    return bf
-
-
-def read_map_single(file_handles:list[BufferedIOBase], n_pts:int, ref=None):
-
-    """ Reads a single map of **RAW US** """ 
-
-    us = np.zeros((len(file_handles), n_pts), dtype=np.int16)
-    for chno, file in enumerate(file_handles): # NOTE  : files need to be numerically sorted
-        dat = file.read(n_pts * 2 ) # np.int16 : two bytes per point
-        us[chno,:] = np.frombuffer(dat, dtype=np.int16)
-    us = us - (us // 2048) * 4096
-    us = us.astype(float)
-
-    if ref is not None: return us - ref
-    return us
-
-
-###########################################
-########## Beamforming : _G_PU ############
-###########################################
-
-@cuda.jit
-def bf_cuda_batch(us:np.ndarray, 
-              bf:np.ndarray, 
-              dj:np.ndarray):
-    
-    # us is [nt [blockIdx], ni0 [threadIdx], nj0 [we for loop over them]]
-    # retards is [ni [we sum over them], nj0 [we for loop over them]]
-    # i0 : no voie du speckle beamformé
-    # j0 : no échantillon du speckle beamformé
-    # i : no voie du speckle original
-    # j : no échantillon du speckle original
-
-    i0 = cuda.threadIdx.x
-    ni0 = cuda.blockDim.x
-    t = cuda.blockIdx.x
-    max_size = us.size # bf has the same size
-    bf_sum_on, nj0 = dj.shape
-
-    for j0 in range(nj0-1):
-
-        idx_bf = (t * ni0 + i0) * nj0 + j0
-        rows_retards = range(0, bf_sum_on)
-        valid_idx_bf = idx_bf < max_size
-        n_sum = 0
-       
-        for row in rows_retards:
-
-            i = i0 + row - (bf_sum_on - 1)//2
-            j = j0 + dj[row, j0]
-            j_int = np.floor(j).astype(np.int_)
-            frac_left = (1 - j) % 1
-            frac_right = (j) % 1
-
-            idx_us_left  = (t * ni0 + i) * nj0 + j_int
-            idx_us_right = (t * ni0 + i) * nj0 + j_int + 1
-
-            valid_i = (i >= 0) & (i < ni0)
-            valid_j = (j_int + 1 < nj0)
-            valid_us_idx = (idx_us_right < max_size)
-
-            if valid_j & valid_i & valid_us_idx & valid_idx_bf:
-                n_sum += 1
-                bf[idx_bf] += frac_left * us[idx_us_left] + frac_right * us[idx_us_right]            
-
-        if n_sum == 0:
-            print(i0, j0)
-        bf[idx_bf] = bf[idx_bf] / n_sum
-
-    # Fix for what happens at coordinates (t, i0, nj0-1)
-    bf[(t * ni0 + i0) * nj0 + (nj0 - 1)] = us[(t * ni0 + i0) * nj0 + (nj0 - 1)]
-
-
-def beamform_gpu(file_strs:list[str], config:dict, ref=None, recompute=False, blocks_per_grid=1) -> list[str]:
-
-    """Beamforms all ultrasound files on the _G_PU. You can trim the files in x (time_us axis)
-    with the `left` and `right` indices.
-    
-    NOTE 1 : Beamformed files are in __float32__ format their name is Speckle_xxx.dbf
-    NOTE 2 : Writing in BF files is buffered
-    NOTE 3 : We call a numba-accelerated function `beamform_one`
-    NOTE 4 : By default we are not recomputing the files !
-    """
-    
-    # Check if we need to work
-    bf_file_strs = [f_str.replace('.dat', '.dbf') for f_str in file_strs]
-    match = glob.glob(file_strs[0].replace('.dat', '.dbf'))
-    if (not recompute) and match:
-        print('beamform_gpu: Found .dbf files, not recomputing')
-        return bf_file_strs
-
-    # Extracting relevant info from the config dict
-    t_us = np.array(config['Time_us'])*1e-3
-    n_pts = len(t_us)
-    n_waveforms = config['Nsequence'] * config['Nb_tir']
-    n_chan = config['nbvoie']
-    n_chan_bf = config['n_chan_bf']
-    c = config['C_p'] 
-    pitch = config['pitch'] * 1e-3 # convert to USI
-    fech = config['rsf'] * 1e6 # convert to USI
-    
-    # Trimming signal
-    left = config['left']
-    right = config['right']
-    
-    # CUDA parameters
-    threadsperblock = n_chan
-    n_iters = np.ceil(n_waveforms/blocks_per_grid).astype(np.int_)
-
-    # Beamforming loop
-    orig_files = open_all(file_strs)
-    bf_files = open_all(bf_file_strs, mode='w')
-    dj = compute_delays(t_us, c, pitch, fech, n_chan_bf)
-
-    for _ in tqdm(range(n_iters), 
-                     desc='beamform' + Fore.GREEN + ' using GPU' + Style.RESET_ALL):
-
-        us = read_map_batch(orig_files, n_pts=n_pts, batch_size=blocks_per_grid, ref=ref)
-        us_flat = us.ravel()
-        bf_flat = np.zeros_like(us_flat)
-
-        bf_cuda_batch[blocks_per_grid, threadsperblock](us_flat, bf_flat, dj) # NOTE: add 'right' in kernel
-        write_map(bf_files, bf_flat.reshape(us.shape))
-
-    close_all(bf_files)
-    close_all(orig_files)
-    return bf_file_strs
-
-
-def read_map_batch(file_handles:list[BufferedIOBase], n_pts:int, ref=None, batch_size=1, mode='dat') -> np.ndarray:
-    """ Reads a batch of US maps. NB: mode must be .dat or .dbf !
-    
-    NOTE: nskip represent the number of bytes skipped at the beginning of the file. We "simulate" the same
-    number of metadata bytes as in the original files ==> 30 int16 ==> 120 bytes
-    
-    NOTE 2 : There is no check whatsoever that the number of bytes requested will be effectively
-    loaded, in particular at the end of the file...""" 
-
-    dat_list = []
-
-    if mode == 'dat':
-        for file in file_handles: # NOTE  : files need to be numerically sorted
-            dat = file.read(batch_size * n_pts * 2 ) # np.int16 : two bytes per point
-            dat = np.reshape(np.frombuffer(dat, dtype=np.int16), [-1, n_pts])
-            dat = (dat - (dat // 2048) * 4096).astype(float)
-            dat_list.append(dat)
-        
-    if mode == 'dbf':
-        for file in file_handles: # NOTE  : files need to be numerically sorted
-            dat = file.read(batch_size * n_pts * 4 ) # np.int16 : two bytes per point
-            dat = np.reshape(np.frombuffer(dat, dtype=np.float32), [-1, n_pts])
-            dat_list.append(dat)
-
-    us = np.stack(dat_list)
-    us = np.moveaxis(us, 1, 0)      # us is now (Nt, Nz, Nx)
-
-    if ref is not None: 
-        if ref.ndim == 2: 
-            ref = ref[np.newaxis, :, :]
-            us = us - ref
-
-    return us

@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+torchaudio # Accelerates convolution
+torch # Accelerates hilbert transforms
+numpy
+scipy
+matplotlib
+colorama
+tqdm # Nice progress bars
+jupyterlab
+ipywidgets # Interactive widgets with matplotlib
+ipympl # Usually needed to interface widgets and matplotlib
