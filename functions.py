@@ -10,8 +10,8 @@ from numpy.lib.stride_tricks import sliding_window_view
 from torchaudio.transforms import FFTConvolve, Convolve
 from scipy.io import loadmat
 from io import BufferedIOBase
-from tqdm.notebook import tqdm
-from IPython.display import Markdown, display
+from tqdm import tqdm
+from colorama import Fore, Style
 
 """
 Quick disclaimer : 
@@ -25,13 +25,25 @@ n_z or n_i0 is the number of channels : it should be 128
 #####################################
 ############## PRETTY PRINTS #######
 
-def printm(text:str, color=None):
+def printm(text:str, color=None, bold=False):
     """ A pretty print using Markdown"""
-    if color is None:
-        colorstr = text
-    else:
-        colorstr = f"<span style='color:{color}'>{text}</span>"
-    display(Markdown(colorstr))
+
+    color_dict = {'cyan':Fore.CYAN,
+                  'blue':Fore.BLUE,
+                  'red':Fore.RED,
+                  'green':Fore.GREEN,
+                  'yellow':Fore.YELLOW,
+                  'magenta':Fore.MAGENTA}
+
+    color_key = ''
+    bold_key = ''
+
+    if color in color_dict:
+        color_key = color_dict[color]
+    if bold:
+        bold_key = Style.BRIGHT
+    
+    print(f"{bold_key}{color_key}{text}{Style.RESET_ALL}")
 
 
 def print_details(path:str, config:dict):
@@ -42,11 +54,20 @@ def print_details(path:str, config:dict):
     overlap = 1 - config['stride'] / config['window']
     rotor = config['right']
     device = config['device']
+    npulses = config['npulses']
+    npulses_total = config['npulses_total']
+    nseqs = config['nseqs']
+    frep = config['frep']
+    dtseq = 1/config['fseq']
 
-    printm('-----')
-    printm(f'**Processing {abspath} : Using {device}**', color='green' if device == 'cuda' else 'orange')
-    printm(f'Ref. used : {absrefpath}')
-    printm(f'Window size = {n_wavelengths:.2f} λ | Overlap {overlap:.2f} | Rotor position {rotor} px')
+    printm('-'*70)
+    printm(f'**Using {device}**', color='green' if device == 'cuda' else 'yellow', bold=True)
+    printm(f'Processing  : {abspath}')
+    printm(f'Reference   : {absrefpath}')
+    printm(f'N_pulses    = {npulses        :5d}   | N_sequences = {nseqs    :6d}   | Total pulses : {npulses_total}') 
+    printm(f'F_rep_pulse = {frep           :5d}   | DT_sequence = {dtseq  :6.1f} s |')
+    printm(f'Window size = {n_wavelengths:5.2f} λ | Overlap     = {overlap:6.2f}   | Rotor position {rotor:5d} px')
+
 
 ######################################
 ############ FILE MANAGEMENT #########
@@ -73,6 +94,8 @@ def update_config(config:dict, prms:dict, save_path=None, ref_path=None) -> dict
 
     config['ref_path'] = ref_path
     config['path'] = save_path
+    config['frep'] = int(config['frep'][0]) if (type(config['frep']) == list) else config['frep']
+
 
     if prms['right'] >= config['nx']:
         printm(f'update_config: right={prms["right"]} too far, changing it to {config["nx"]-1}')  
@@ -265,7 +288,7 @@ def make_ref(ref_path:str,
     n_pts = ref_config['nx']      # Length of the signal (~640)
     ref = np.zeros((n_channels, n_pts))
 
-    for chno in tqdm(range(n_channels), desc='make_ref'):
+    for chno in tqdm(range(n_channels), desc='> make_ref'):
         data = read_waveform(dat_files[chno], ref_config)
         ref[chno, :] = np.mean(data, axis=0)
 
@@ -392,7 +415,7 @@ def process(bf_files:list[str], config:dict, recompute=True, sep='\\'):
     score_all = []
 
 
-    for file in tqdm(bf_files, desc= 'process'):
+    for file in tqdm(bf_files, desc = '> process '):
         us = read_waveform(file, config, mode='bf') # Ref already subtracted
         hil_all.append(hilbert(us, window, stride))
         disp, score = displacement(us, window, stride, max_disp)
@@ -493,7 +516,7 @@ def bf_indices_coeffs(config:dict) -> tuple[torch.tensor]:
     jint = jint.astype(np.int_)
     coeff_left = (1-jfrac)
     coeff_right = jfrac
-    
+
     i0 = np.moveaxis(np.tile(np.arange(nz), [nx,2*nbf+1,1]), [0,1,2], [1,2,0])  # Build 3d table with i0 indices
     i = i0 + np.tile(np.arange(-nbf,nbf+1), [nz,nx,1]) # Build 3d table with i = i0 + (i-i0) indices (they increase over the 3rd dimension)
     
@@ -545,16 +568,22 @@ def beamform(file_strs:list[str], config:dict, ref=None, recompute=False, batch_
     bf_files = open_all(bf_file_strs, mode='w')
     idx_left, idx_right, weight_left, weight_right, n_valid = bf_indices_coeffs(config)
     
-    for _ in tqdm(range(n_batches), desc='beamform'):
+    for _ in tqdm(range(n_batches), desc='> beamform'):
 
         bf_batch = []
         us_batch = read_map_batch(orig_files, n_pts=n_pts, ref=ref, batch_size=batch_size)
         us_batch_flat = torch.tensor(np.reshape(us_batch, [batch_size, -1])) # 2d us_batch 
 
+        # print(us_batch_flat.shape)
+        # print(weight_left)
+        # print(weight_right)
+
+
         for us_flat in us_batch_flat:
             bf = (weight_left * us_flat[idx_left] 
                   + weight_right * us_flat[idx_right]) \
                   .sum(dim=-1) / n_valid
+            
             bf_batch.append(bf)
 
         # When batch is processed, back to numpy

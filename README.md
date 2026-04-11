@@ -23,11 +23,17 @@ The code will benefit from CUDA capabilities (x5 to x10 in terms of processing s
 
 First, you need to [install Python](https://www.python.org/downloads/). I don't like Conda bloatware so much, so I go directly from the Python website. 
 
-Install the dependencies (using `pip`) if you _do_ have a CUDA GPU : 
+### If you do have CUDA (= NVIDIA GPU)
+
+You need to [install CUDA](https://developer.nvidia.com/cuda/toolkit) on your machine. Install the latest version that [Pytorch supports](https://pytorch.org/get-started/locally/) and make sure that the file `requirements_cuda.txt` points to the same version (here, I installed version 13.0 and the requirements file also points to version 13.0). 
+
+You can then install the dependencies (using `pip`) if you _do_ have a CUDA GPU : 
 
 ```
     pip install -r requirements_cuda.txt
 ```
+
+### If you don't have CUDA
 
 Otherwise if you _don't_ have a CUDA GPU : 
 
@@ -83,3 +89,8 @@ There are also obvious differences related to the `rotor_position` despite me us
 
 <img src="Imgs/velocity_maps_benchmark.jpg" div-align="center">
 
+## Known bugs / quirks
+
+* If you have multiple sequences, the program will compute the displacement (and the velocity) between all image pairs, including pairs with a last frame from sequence $n$ and the first from sequence $n+1$. You might then have to remove such values. I am keeping the code as is since achieving really low repetition rates has to be done using sequences of 1 pulses (cf. what we did with Waxy Oils).
+
+* The code assumes the same $\Delta t$ between sequences and the same $f_{rep}$ within all sequences. I don't think we have ever done something different.
