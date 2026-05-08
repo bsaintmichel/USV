@@ -2,3 +2,6 @@ __pycache__/
 data/
 archive/
 .ipynb_checkpoints/
+usv_processing/ 
+# usv_processing is the Python virtual environment name
+*.7z

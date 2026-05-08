@@ -61,7 +61,6 @@ def print_details(path:str, config:dict):
     dtseq = 1/config['fseq']
 
     printm('-'*70)
-    printm(f'**Using {device}**', color='green' if device == 'cuda' else 'yellow', bold=True)
     printm(f'Processing  : {abspath}')
     printm(f'Reference   : {absrefpath}')
     printm(f'N_pulses    = {npulses        :5d}   | N_sequences = {nseqs    :6d}   | Total pulses : {npulses_total}') 
